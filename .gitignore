@@ -8,3 +8,8 @@ __pycache__/
 *.pyc
 agents.json
 api.csv
+.venv
+# Virtual environments
+venv/
+.venv/
+

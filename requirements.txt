@@ -1,8 +1,9 @@
-telethon
-pymongo
-python-dotenv
-pytz
-qrcode
-Pillow
-requests
-PySocks
+python-telegram-bot==20.7
+pymongo[srv]==4.6.1
+dnspython==2.4.2
+python-dotenv==1.0.0
+aiohttp==3.9.1
+telethon==1.34.0
+cryptg==0.4.0
+Flask==3.0.0
+opentele==1.15.1
