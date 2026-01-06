@@ -183,8 +183,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(MESSAGES[lang]['product_list'], callback_data='product_list')
         ],
         [
-            InlineKeyboardButton(MESSAGES[lang]['recharge'], callback_data='recharge'),
-            InlineKeyboardButton(MESSAGES[lang]['exchange_trx'], callback_data='exchange_trx')
+            InlineKeyboardButton(MESSAGES[lang]['recharge'], callback_data='recharge')
         ],
         [
             InlineKeyboardButton(MESSAGES[lang]['contact_service'], url='https://t.me/support')
@@ -220,8 +219,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_continents(update, context)
     elif data == 'recharge':
         return await start_recharge(update, context)
-    elif data == 'exchange_trx':
-        await query.message.reply_text("💱 TRX Exchange feature coming soon!")
     elif data == 'switch_language':
         await switch_language(update, context)
     elif data == 'back_to_menu':
@@ -517,15 +514,17 @@ async def process_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE, ne
     
     amount = context.user_data.get('deposit_amount', 0)
     
-    # Add 1.7% verification fee
-    exact_amount = amount * 1.017
+    # Generate unique random amount for verification (1-99 cents)
+    import random
+    random_cents = random.randint(1, 99)
+    exact_amount = amount + (random_cents / 1000)  # e.g., 5.017, 5.043, 5.091
     
     # Get wallet address based on network
     if network == 'bep20':
-        wallet = "0x1234567890abcdef1234567890abcdef12345678"  # Replace with real BEP-20 wallet
+        wallet = config.USDT_BEP20_WALLET
         network_name = "BEP-20 (BSC)"
     else:  # trc20
-        wallet = "TAbcdefghijklmnopqrstuvwxyz1234567890"  # Replace with real TRC-20 wallet
+        wallet = config.USDT_TRC20_WALLET
         network_name = "TRC-20 (TRON)"
     
     # Create transaction record
@@ -551,10 +550,28 @@ async def process_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE, ne
     
     await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
     
+    # Notify admin about pending deposit
+    try:
+        admin_text = (
+            f"New Deposit Request\n\n"
+            f"User ID: {user_id}\n"
+            f"Amount: ${amount:.2f}\n"
+            f"Exact: {exact_amount:.3f} USDT\n"
+            f"Network: {network_name}\n"
+            f"Wallet: {wallet[:10]}...\n"
+            f"Transaction ID: {transaction['_id']}"
+        )
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text=admin_text
+        )
+    except Exception as e:
+        logger.error(f"Could not notify admin: {e}")
+    
     # Start payment verification in background
-    asyncio.create_task(verify_payment(transaction['_id'], user_id, wallet, exact_amount))
+    asyncio.create_task(verify_payment(transaction['_id'], user_id, wallet, exact_amount, context.bot))
 
-async def verify_payment(transaction_id, user_id: int, wallet: str, expected_amount: float):
+async def verify_payment(transaction_id, user_id: int, wallet: str, expected_amount: float, bot):
     """Verify crypto payment (background task)"""
     lang = get_user_language(user_id)
     
@@ -577,8 +594,6 @@ async def verify_payment(transaction_id, user_id: int, wallet: str, expected_amo
             
             # Notify user
             try:
-                from telegram import Bot
-                bot = Bot(token=BOT_TOKEN)
                 await bot.send_message(
                     chat_id=user_id,
                     text=MESSAGES[lang]['payment_verified'].format(amount)
@@ -586,12 +601,42 @@ async def verify_payment(transaction_id, user_id: int, wallet: str, expected_amo
             except Exception as e:
                 logger.error(f"Could not notify user {user_id}: {e}")
             
+            # Notify admin
+            try:
+                admin_text = (
+                    f"Payment Verified!\n\n"
+                    f"User ID: {user_id}\n"
+                    f"Amount: ${amount:.2f}\n"
+                    f"Credited successfully"
+                )
+                await bot.send_message(
+                    chat_id=config.OWNER_ID,
+                    text=admin_text
+                )
+            except Exception as e:
+                logger.error(f"Could not notify admin: {e}")
+            
             return
         
         await asyncio.sleep(10)
     
     # Payment not received after timeout
     Transaction.update_status(transaction_id, 'failed')
+    
+    # Notify admin of failed payment
+    try:
+        admin_text = (
+            f"Payment Timeout\n\n"
+            f"User ID: {user_id}\n"
+            f"Expected: {expected_amount:.3f} USDT\n"
+            f"Status: Not received after 10 minutes"
+        )
+        await bot.send_message(
+            chat_id=config.OWNER_ID,
+            text=admin_text
+        )
+    except:
+        pass
 
 async def switch_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Switch user language"""

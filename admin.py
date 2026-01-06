@@ -328,7 +328,7 @@ async def receive_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     await update.message.reply_text(
-        "✅ Session uploaded successfully!\n\n"
+        "Session uploaded successfully!\n\n"
         f"Country: {session['country']}\n"
         f"Phone: {session['phone_number']}\n"
         f"Price: ${session['price']:.2f}\n"
