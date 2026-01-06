@@ -1,0 +1,10 @@
+.env
+*.session
+*.session-journal
+downloads/
+sold/
+logs/
+__pycache__/
+*.pyc
+agents.json
+api.csv

@@ -1,0 +1,8 @@
+telethon
+pymongo
+python-dotenv
+pytz
+qrcode
+Pillow
+requests
+PySocks
