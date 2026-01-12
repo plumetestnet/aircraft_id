@@ -1176,6 +1176,10 @@ def main():
     # Initialize database
     init_db()
     
+     # Start keep-alive server (for Render health checks)
+    from keep_alive import keep_alive
+    keep_alive()
+
     # ✅ FIXED: Create application FIRST before adding any handlers
     application = Application.builder().token(config.BOT_TOKEN).build()
     
