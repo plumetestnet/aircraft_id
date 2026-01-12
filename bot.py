@@ -1,16 +1,17 @@
 import logging
-import os
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters, ConversationHandler
-)
-from database import init_db, User, TelegramSession, Transaction
-from config import BOT_TOKEN, OWNER_ID
-from admin import setup_admin_handlers
-from payment import verify_crypto_payment
 import asyncio
+import random
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    filters, ConversationHandler, ContextTypes
+)
+# ✅ FIXED: Added init_db to imports
+from database import User, BulkSession, Transaction, Purchase, SystemSettings, init_db
+from zip_utils import extract_sessions_from_bulk
+import config
+from country_utils import get_country_info
 
 # Setup logging
 logging.basicConfig(
@@ -20,8 +21,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-WAITING_DEPOSIT_AMOUNT, WAITING_COUNTRY_CODE = range(2)
+WAITING_DEPOSIT_AMOUNT = 0
+WAITING_QUANTITY = 1
 
+# Import admin handlers
+from admin import setup_admin_handlers
 # Language dictionary
 MESSAGES = {
     'en': {
@@ -40,7 +44,7 @@ MESSAGES = {
         'select_country': "🌍 Select Country:",
         'session_format': "{} - {} session(s) - ${:.2f}",
         'no_sessions': "❌ No sessions available for this country.",
-        'enter_deposit': "💳 Enter deposit amount in USD (minimum $1):",
+        'enter_deposit': "💳 Enter deposit amount in USD (minimum $1):\n\n💡 Or choose a preset amount:",
         'deposit_method': "💳 Select payment method:",
         'usdt_bep20': "USDT (BEP-20)",
         'usdt_trc20': "USDT (TRC-20)",
@@ -70,7 +74,7 @@ MESSAGES = {
         'select_country': "🌍 选择国家:",
         'session_format': "{} - {} 会话 - ${:.2f}",
         'no_sessions': "❌ 该国家暂无可用会话。",
-        'enter_deposit': "💳 输入充值金额(美元,最低$1):",
+        'enter_deposit': "💳 输入充值金额(美元,最低$1):\n\n💡 或选择预设金额:",
         'deposit_method': "💳 选择支付方式:",
         'usdt_bep20': "USDT (BEP-20)",
         'usdt_trc20': "USDT (TRC-20)",
@@ -101,6 +105,8 @@ CONTINENTS = {
             '+84': {'name': 'Vietnam', 'name_zh': '越南'},
             '+63': {'name': 'Philippines', 'name_zh': '菲律宾'},
             '+62': {'name': 'Indonesia', 'name_zh': '印度尼西亚'},
+            '+880': {'name': 'Bangladesh', 'name_zh': '孟加拉国'},
+            '+92': {'name': 'Pakistan', 'name_zh': '巴基斯坦'},
         }
     },
     'europe': {
@@ -152,6 +158,24 @@ def get_message(user_id: int, key: str) -> str:
     lang = get_user_language(user_id)
     return MESSAGES[lang].get(key, MESSAGES['en'][key])
 
+def get_persistent_keyboard(lang='en'):
+    """Create persistent keyboard with bottom buttons"""
+    keyboard = [
+        [
+            KeyboardButton("🛒 Products" if lang == 'en' else "🛒 商品"),
+            KeyboardButton("🌐 Recharge" if lang == 'en' else "🌐 充值")
+        ],
+        [
+            KeyboardButton("📞 Contact Customer Service" if lang == 'en' else "📞 联系客服"),
+            KeyboardButton("👤 Personal Center" if lang == 'en' else "👤 个人中心")
+        ],
+        [
+            KeyboardButton("🌍 Language" if lang == 'en' else "🌍 语言"),
+            KeyboardButton("⚠️ Rules" if lang == 'en' else "⚠️ 规则")
+        ]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     user = update.effective_user
@@ -167,7 +191,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and len(context.args) > 0:
         country_code = context.args[0]
         if country_code.startswith('+'):
-            await show_country_sessions(update, context, country_code)
+            await select_country(update, context)
             return
     
     await show_main_menu(update, context)
@@ -194,6 +218,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    # Get persistent keyboard
+    persistent_kb = get_persistent_keyboard(lang)
+    
     if update.callback_query:
         await update.callback_query.message.edit_text(
             MESSAGES[lang]['welcome'],
@@ -202,75 +229,44 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             MESSAGES[lang]['welcome'],
+            reply_markup=persistent_kb
+        )
+        await update.message.reply_text(
+            "📋 Quick Menu:",
             reply_markup=reply_markup
         )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button callbacks"""
+async def show_user_center(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user center"""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
-    data = query.data
-    
-    if data == 'user_center':
-        await show_user_center(update, context)
-    elif data == 'product_list':
-        await show_continents(update, context)
-    elif data == 'recharge':
-        return await start_recharge(update, context)
-    elif data == 'switch_language':
-        await switch_language(update, context)
-    elif data == 'back_to_menu':
-        await show_main_menu(update, context)
-    elif data.startswith('continent_'):
-        continent = data.replace('continent_', '')
-        await show_countries(update, context, continent)
-    elif data.startswith('country_'):
-        country_code = data.replace('country_', '')
-        await show_country_sessions(update, context, country_code)
-    elif data.startswith('buy_session_'):
-        session_id = data.replace('buy_session_', '')
-        await purchase_session_handler(update, context, session_id)
-    elif data.startswith('deposit_'):
-        network = data.replace('deposit_', '')
-        await process_deposit(update, context, network)
-    elif data == 'cancel_deposit':
-        await show_main_menu(update, context)
-        return ConversationHandler.END
-
-async def show_user_center(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user center with balance info"""
-    query = update.callback_query
-    user_id = update.effective_user.id
     lang = get_user_language(user_id)
     
     user = User.get_by_telegram_id(user_id)
-    balance = user.get('balance', 0.0)
-    created_at = user.get('created_at', datetime.now()).strftime('%Y-%m-%d')
+    balance = user.get('balance', 0) if user else 0
+    created_at = user.get('created_at', datetime.utcnow()).strftime('%Y-%m-%d') if user else 'Unknown'
     
     text = MESSAGES[lang]['user_info'].format(user_id, balance, created_at)
     
-    keyboard = [
-        [InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='back_to_menu')]
-    ]
+    keyboard = [[InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='back_to_menu')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.message.edit_text(text, reply_markup=reply_markup)
 
-async def show_continents(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_product_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show continent selection"""
     query = update.callback_query
+    await query.answer()
+    
     user_id = update.effective_user.id
     lang = get_user_language(user_id)
     
     keyboard = []
-    for continent_code, continent_data in CONTINENTS.items():
+    for continent_id, continent_data in CONTINENTS.items():
         continent_name = continent_data['name'][lang]
-        keyboard.append([InlineKeyboardButton(
-            continent_name,
-            callback_data=f'continent_{continent_code}'
-        )])
+        keyboard.append([InlineKeyboardButton(continent_name, callback_data=f'continent_{continent_id}')])
     
     keyboard.append([InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='back_to_menu')])
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -280,211 +276,453 @@ async def show_continents(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
-async def show_countries(update: Update, context: ContextTypes.DEFAULT_TYPE, continent: str):
-    """Show countries in selected continent"""
+async def show_continent_countries(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show countries with available bulks"""
     query = update.callback_query
+    await query.answer()
+    
+    continent = query.data.replace('continent_', '')
     user_id = update.effective_user.id
     lang = get_user_language(user_id)
     
-    continent_data = CONTINENTS.get(continent, {})
-    countries = continent_data.get('countries', {})
+    # Get available countries from bulks (✅ UPDATED)
+    countries_data = BulkSession.get_available_countries()
     
-    keyboard = []
-    for code, country_data in countries.items():
-        country_name = country_data['name_zh'] if lang == 'zh' else country_data['name']
-        # Get session count for this country
-        sessions = TelegramSession.get_available_by_country(code)
-        count = len(sessions)
+    # Filter by continent
+    continent_countries = {}
+    for country in countries_data:
+        country_code = country['_id']
+        info = get_country_info(country_code)
         
-        button_text = f"{country_name} ({count})"
+        if info and info['continent'].lower() == continent.lower():
+            continent_countries[country_code] = country
+    
+    if not continent_countries:
+        await query.message.edit_text(
+            f"❌ No sessions available in {continent.title()}\n\n"
+            "Check back later!"
+        )
+        return
+    
+    # Build message
+    text = f"🌍 **{continent.title()} - Select Country:**\n\n"
+    keyboard = []
+    
+    for country_code in sorted(continent_countries.keys()):
+        data = continent_countries[country_code]
+        info = get_country_info(country_code)
+        country_name = info['name']
+        
+        available = data['total_available']
+        min_price = data['min_price']
+        
+        button_text = f"{country_name} ({country_code}) - {available} - ${min_price:.2f}/each"
         keyboard.append([InlineKeyboardButton(
             button_text,
-            callback_data=f'country_{code}'
+            callback_data=f'country_{country_code}'
         )])
     
-    keyboard.append([InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='product_list')])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data='product_list')])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.message.edit_text(
-        MESSAGES[lang]['select_country'],
-        reply_markup=reply_markup
-    )
+    await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
-async def show_country_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE, country_code: str):
-    """Show available sessions for a country"""
+async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show country and ask for quantity"""
+    query = update.callback_query
+    await query.answer()
+    
+    country_code = query.data.replace('country_', '')
     user_id = update.effective_user.id
-    lang = get_user_language(user_id)
     
-    sessions = TelegramSession.get_available_by_country(country_code)
+    # Get available bulks
+    bulks = BulkSession.get_by_country(country_code)
     
-    if not sessions:
-        text = MESSAGES[lang]['no_sessions']
-        keyboard = [[InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='product_list')]]
+    if not bulks:
+        await query.message.edit_text("❌ No sessions available")
+        return ConversationHandler.END
+    
+    # Get cheapest bulk
+    bulk = bulks[0]  # Already sorted by price
+    
+    info = get_country_info(country_code)
+    country_name = info['name'] if info else country_code
+    
+    # Calculate total available
+    total_available = sum(b['remaining_count'] for b in bulks)
+    price = bulk['price_per_session']
+    session_type = bulk['session_type']
+    
+    text = (
+        f"🌍 **{country_name}** ({country_code})\n\n"
+        f"📊 Available: **{total_available} sessions**\n"
+        f"💰 Price: **${price:.2f}** per session\n"
+        f"📁 Type: {session_type.upper()}\n\n"
+        f"Enter quantity **(1-{min(total_available, 100)})**:"
+    )
+    
+    # Store for next step
+    context.user_data['selected_country'] = country_code
+    context.user_data['selected_bulk_id'] = str(bulk['_id'])
+    context.user_data['max_quantity'] = total_available
+    context.user_data['price_per_session'] = price
+    context.user_data['session_type'] = session_type
+    
+    keyboard = [[InlineKeyboardButton("« Cancel", callback_data='product_list')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    
+    return WAITING_QUANTITY
+
+async def receive_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process quantity input"""
+    user_id = update.effective_user.id
+    
+    try:
+        quantity = int(update.message.text.strip())
+        
+        max_qty = min(context.user_data.get('max_quantity', 0), 100)
+        
+        if quantity < 1:
+            await update.message.reply_text("❌ Minimum quantity is 1")
+            return WAITING_QUANTITY
+        
+        if quantity > max_qty:
+            await update.message.reply_text(
+                f"❌ Maximum quantity is {max_qty}\n\n"
+                f"Available: {context.user_data.get('max_quantity', 0)}\n"
+                f"Per order limit: 100"
+            )
+            return WAITING_QUANTITY
+        
+        price_per = context.user_data['price_per_session']
+        total_price = quantity * price_per
+        
+        country_code = context.user_data['selected_country']
+        info = get_country_info(country_code)
+        country_name = info['name'] if info else country_code
+        
+        # Check balance
+        user = User.get_by_telegram_id(user_id)
+        balance = user['balance']
+        
+        if balance < total_price:
+            await update.message.reply_text(
+                f"❌ **Insufficient Balance!**\n\n"
+                f"Need: ${total_price:.2f}\n"
+                f"Have: ${balance:.2f}\n"
+                f"Short: ${total_price - balance:.2f}\n\n"
+                f"Please recharge your account.",
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+        
+        # Show confirmation
+        session_type = context.user_data['session_type']
+        
+        text = (
+            f"📊 **Purchase Summary**\n\n"
+            f"🌍 Country: {country_name} ({country_code})\n"
+            f"📦 Quantity: {quantity} sessions\n"
+            f"📁 Type: {session_type.upper()}\n"
+            f"💰 Price: ${price_per:.2f} × {quantity}\n"
+            f"💵 Total: **${total_price:.2f}**\n\n"
+            f"💳 Your balance: ${balance:.2f}\n"
+            f"💳 After purchase: ${balance - total_price:.2f}\n\n"
+            f"Confirm purchase?"
+        )
+        
+        context.user_data['purchase_quantity'] = quantity
+        context.user_data['purchase_total'] = total_price
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Confirm", callback_data='confirm_bulk_purchase'),
+                InlineKeyboardButton("❌ Cancel", callback_data='cancel_purchase')
+            ]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        if update.callback_query:
-            await update.callback_query.message.edit_text(text, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(text, reply_markup=reply_markup)
-        return
-    
-    # Get country name
-    country_name = country_code
-    for continent_data in CONTINENTS.values():
-        if country_code in continent_data['countries']:
-            country_data = continent_data['countries'][country_code]
-            country_name = country_data['name_zh'] if lang == 'zh' else country_data['name']
-            break
-    
-    text = f"🌍 {country_name} - {len(sessions)} sessions available\n\n"
-    
-    keyboard = []
-    for session in sessions[:10]:  # Show max 10 sessions
-        session_id = str(session['_id'])
-        price = session.get('price', 0.0)
-        info = session.get('info', 'No info')
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        return ConversationHandler.END
         
-        button_text = f"${price:.2f} - {info[:30]}"
-        keyboard.append([InlineKeyboardButton(
-            button_text,
-            callback_data=f'buy_session_{session_id}'
-        )])
-    
-    keyboard.append([
-        InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='product_list'),
-        InlineKeyboardButton(MESSAGES[lang]['close'], callback_data='back_to_menu')
-    ])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.callback_query:
-        await update.callback_query.message.edit_text(text, reply_markup=reply_markup)
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid number!\n\n"
+            "Please enter a valid quantity (e.g., 10)"
+        )
+        return WAITING_QUANTITY
 
-async def purchase_session_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: str):
-    """Handle session purchase with TData support"""
+async def confirm_bulk_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process bulk purchase and extract sessions"""
     query = update.callback_query
+    await query.answer()
+    
     user_id = update.effective_user.id
-    lang = get_user_language(user_id)
     
-    user = User.get_by_telegram_id(user_id)
-    session = TelegramSession.get_by_id(session_id)
+    # Get purchase details
+    bulk_id = context.user_data.get('selected_bulk_id')
+    quantity = context.user_data.get('purchase_quantity')
+    total_price = context.user_data.get('purchase_total')
+    country_code = context.user_data.get('selected_country')
+    session_type = context.user_data.get('session_type')
     
-    if not session:
-        await query.answer("❌ Session not found!", show_alert=True)
+    if not all([bulk_id, quantity, total_price, country_code]):
+        await query.message.edit_text("❌ Session expired. Please try again.")
         return
     
-    price = session.get('price', 0.0)
-    balance = user.get('balance', 0.0)
+    # Get bulk
+    bulk = BulkSession.get_by_id(bulk_id)
+    if not bulk:
+        await query.message.edit_text("❌ Sessions no longer available")
+        return
     
-    if balance < price:
-        await query.answer(f"❌ Insufficient balance! Need ${price:.2f}", show_alert=True)
+    # Purchase sessions (marks as sold in DB)
+    await query.message.edit_text("⏳ Processing purchase...")
+    
+    purchased_indices, error = BulkSession.purchase_sessions(bulk_id, quantity)
+    if error:
+        await query.message.edit_text(f"❌ Purchase failed!\n\n{error}")
         return
     
     # Deduct balance
-    User.update_balance(user_id, -price)
+    User.update_balance(user_id, total_price, operation='subtract')
     
-    # Mark session as sold
-    TelegramSession.mark_as_sold(session_id, user_id)
+    # Extract sessions from bulk ZIP
+    await query.message.edit_text(
+        "⏳ **Preparing your sessions...**\n"
+        "(Extracting from bulk ZIP)\n\n"
+        "This may take a moment..."
+    )
     
-    # Create transaction record
-    Transaction.create(
+    new_file_id, error = await extract_sessions_from_bulk(
+        context.bot,
+        bulk['file_id'],
+        purchased_indices,
+        session_type
+    )
+    
+    if error:
+        # Refund on extraction failure
+        User.update_balance(user_id, total_price, operation='add')
+        # Return sessions to bulk
+        # (You may want to add a method to reverse the purchase)
+        
+        await query.message.edit_text(
+            f"❌ **Extraction Error!**\n\n"
+            f"Error: {error}\n\n"
+            f"Your payment has been **refunded**.\n"
+            f"Please contact support if this persists."
+        )
+        return
+    
+    # Create purchase record
+    Purchase.create(
         user_id=user_id,
-        amount=price,
-        transaction_type='purchase',
-        status='completed',
-        description=f"Purchased session for {session.get('country')}"
+        bulk_id=bulk_id,
+        country_code=country_code,
+        quantity=quantity,
+        price_paid=total_price,
+        session_type=session_type,
+        purchased_indices=purchased_indices,
+        zip_file_id=new_file_id
     )
     
-    # Send session details
-    session_string = session.get('session_string', '')
-    phone = session.get('phone_number', 'N/A')
-    password_2fa = session.get('password_2fa', 'No 2FA')
+    info = get_country_info(country_code)
+    country_name = info['name'] if info else country_code
     
-    details = (
-        f"✅ Purchase Successful!\n\n"
-        f"📱 Phone: {phone}\n"
-        f"🔐 2FA: {password_2fa}\n\n"
-        f"💰 Remaining balance: ${balance - price:.2f}\n\n"
-        f"📥 Preparing files..."
+    # Get new balance
+    user = User.get_by_telegram_id(user_id)
+    new_balance = user['balance']
+    
+    # Get 2FA password from bulk
+    has_2fa = bulk.get('has_2fa', False)
+    two_fa_password = bulk.get('two_fa_password')
+    
+    text = (
+        f"✅ **Purchase Successful!**\n\n"
+        f"🌍 Country: {country_name} ({country_code})\n"
+        f"📦 Quantity: {quantity} sessions\n"
+        f"📁 Type: {session_type.upper()}\n"
+        f"💰 Paid: ${total_price:.2f}\n"
+        f"💳 New Balance: ${new_balance:.2f}\n"
     )
     
-    await query.message.reply_text(details)
+    # Add 2FA password if exists
+    if has_2fa and two_fa_password:
+        text += f"🔒 2FA Password: `{two_fa_password}`\n"
+    else:
+        text += f"🔒 2FA: No\n"
     
-    # Prepare files (both .session and .tdata)
+    text += f"\n📥 Sending your sessions..."
+    
+    await query.message.edit_text(text, parse_mode='Markdown')
+    
+    # Send ZIP file
     try:
-        from tdata_converter import prepare_tdata_for_user, cleanup_temp_files
+        caption = f"📦 {quantity} × {country_name} sessions"
+        if has_2fa and two_fa_password:
+            caption += f"\n🔒 2FA: {two_fa_password}"
         
-        files_result = await prepare_tdata_for_user(session_string, phone)
-        
-        if files_result['success']:
-            # Send .session file
-            if files_result['session_file']:
-                with open(files_result['session_file'], 'rb') as f:
-                    await query.message.reply_document(
-                        document=f,
-                        filename=f"{phone}.session",
-                        caption="📄 Telethon Session File"
-                    )
-            
-            # Send .tdata.zip if available
-            if files_result['tdata_file']:
-                with open(files_result['tdata_file'], 'rb') as f:
-                    await query.message.reply_document(
-                        document=f,
-                        filename=f"{phone}_tdata.zip",
-                        caption="📦 TData Format (for Telegram Desktop)"
-                    )
-            
-            # Cleanup
-            cleanup_files = [
-                files_result.get('session_file'),
-                files_result.get('tdata_file')
-            ]
-            cleanup_temp_files([f for f in cleanup_files if f])
-            
-        else:
-            # Fallback - send as text
-            session_bytes = session_string.encode()
-            await query.message.reply_document(
-                document=session_bytes,
-                filename=f"{phone}.session"
-            )
-            
+        await context.bot.send_document(
+            chat_id=user_id,
+            document=new_file_id,
+            caption=caption
+        )
     except Exception as e:
-        logger.error(f"Error preparing files: {e}")
-        # Fallback
-        session_bytes = session_string.encode()
-        await query.message.reply_document(
-            document=session_bytes,
-            filename=f"{phone}.session"
+        logger.error(f"Error sending file: {e}")
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ Error sending file. Please contact support with your purchase ID."
         )
     
-    await show_main_menu(update, context)
+    # Clear context
+    context.user_data.clear()
+    return ConversationHandler.END
 
-async def start_recharge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start recharge process"""
+async def cancel_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel purchase"""
     query = update.callback_query
+    await query.answer()
+    
+    await query.message.edit_text(
+        "❌ Purchase cancelled.\n\n"
+        "No charges made."
+    )
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel and return to main menu"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data.clear()
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+async def start_recharge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start recharge process with preset amounts"""
+    query = update.callback_query
+    await query.answer()
+    
     user_id = update.effective_user.id
     lang = get_user_language(user_id)
     
+    # Get minimum deposit from database
+    min_deposit = SystemSettings.get_min_deposit()
+    
+    # Preset amount buttons
+    keyboard = [
+        [
+            InlineKeyboardButton("💵 $5", callback_data='preset_5'),
+            InlineKeyboardButton("💵 $10", callback_data='preset_10'),
+            InlineKeyboardButton("💵 $20", callback_data='preset_20')
+        ],
+        [
+            InlineKeyboardButton("💵 $50", callback_data='preset_50'),
+            InlineKeyboardButton("💵 $100", callback_data='preset_100')
+        ],
+        [
+            InlineKeyboardButton("✏️ Custom Amount", callback_data='custom_amount')
+        ],
+        [InlineKeyboardButton(MESSAGES[lang]['cancel'], callback_data='cancel_deposit')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    deposit_msg = f"💳 Enter deposit amount in USD (minimum ${min_deposit:.0f}):\n\n💡 Or choose a preset amount:"
+    
     await query.message.edit_text(
-        MESSAGES[lang]['enter_deposit']
+        deposit_msg,
+        reply_markup=reply_markup
     )
     
     return WAITING_DEPOSIT_AMOUNT
 
+async def handle_preset_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """✅ NEW - Handle preset amount selection"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    lang = get_user_language(user_id)
+    
+    # Extract amount from callback data (e.g., "preset_10" -> 10)
+    amount = float(query.data.split('_')[1])
+    
+    # Store amount
+    context.user_data['deposit_amount'] = amount
+    
+    # Show payment method selection
+    keyboard = [
+        [InlineKeyboardButton(MESSAGES[lang]['usdt_bep20'], callback_data='deposit_bep20')],
+        [InlineKeyboardButton(MESSAGES[lang]['usdt_trc20'], callback_data='deposit_trc20')],
+        [InlineKeyboardButton(MESSAGES[lang]['cancel'], callback_data='cancel_deposit')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(
+        f"💰 Amount: ${amount:.2f}\n\n{MESSAGES[lang]['deposit_method']}",
+        reply_markup=reply_markup
+    )
+    
+    return ConversationHandler.END
+
+async def handle_custom_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """✅ NEW - Handle custom amount button - asks user to type amount"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    lang = get_user_language(user_id)
+    
+    # Get min deposit from settings
+    from database import SystemSettings
+    settings = SystemSettings.get()
+    min_deposit = settings.get('min_deposit', 1.0)
+    
+    keyboard = [
+        [InlineKeyboardButton(MESSAGES[lang]['cancel'], callback_data='cancel_deposit')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(
+        f"💵 **Enter Custom Amount**\n\n"
+        f"Type the amount you want to deposit in USD.\n\n"
+        f"Example: 15 or 25.50\n\n"
+        f"Minimum: ${min_deposit:.2f}",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+    
+    # ✅ FIXED: Don't end conversation, keep it active for text input
+    return WAITING_DEPOSIT_AMOUNT
+
 async def receive_deposit_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive and validate deposit amount"""
+    """✅ FIXED - Receive custom deposit amount"""
     user_id = update.effective_user.id
     lang = get_user_language(user_id)
     
     try:
-        amount = float(update.message.text.strip())
-        if amount < 1:
-            await update.message.reply_text(MESSAGES[lang]['invalid_amount'])
+        amount = float(update.message.text.strip().replace('$', ''))
+        
+        # ✅ Check against minimum deposit from settings
+        from database import SystemSettings
+        settings = SystemSettings.get()
+        min_deposit = settings.get('min_deposit', 1.0)
+        
+        if amount < min_deposit:
+            await update.message.reply_text(
+                f"❌ Amount too low!\n\n"
+                f"Minimum deposit: ${min_deposit:.2f}\n"
+                f"You entered: ${amount:.2f}\n\n"
+                f"Please enter an amount of at least ${min_deposit:.2f}:"
+            )
             return WAITING_DEPOSIT_AMOUNT
         
+        # Store amount
         context.user_data['deposit_amount'] = amount
         
         # Show payment method selection
@@ -496,7 +734,7 @@ async def receive_deposit_amount(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            MESSAGES[lang]['deposit_method'],
+            f"💰 Amount: ${amount:.2f}\n\n{MESSAGES[lang]['deposit_method']}",
             reply_markup=reply_markup
         )
         
@@ -507,17 +745,23 @@ async def receive_deposit_amount(update: Update, context: ContextTypes.DEFAULT_T
         return WAITING_DEPOSIT_AMOUNT
 
 async def process_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE, network: str):
-    """Process deposit with specific network"""
+    """✅ FIXED - Process deposit with specific network"""
     query = update.callback_query
+    await query.answer()
+    
     user_id = update.effective_user.id
     lang = get_user_language(user_id)
     
     amount = context.user_data.get('deposit_amount', 0)
     
-    # Generate unique random amount for verification (1-99 cents)
-    import random
-    random_cents = random.randint(1, 99)
-    exact_amount = amount + (random_cents / 1000)  # e.g., 5.017, 5.043, 5.091
+    if amount <= 0:
+        await query.edit_message_text("❌ Invalid amount. Please try again.")
+        return
+    
+    # ✅ Generate unique random amount (1-30 thousandths = max 0.03)
+    # Kept small to avoid payment verification issues
+    random_micro = random.randint(1, 30)
+    exact_amount = amount + (random_micro / 1000)  # e.g., 5.001, 5.015, 5.030
     
     # Get wallet address based on network
     if network == 'bep20':
@@ -527,116 +771,185 @@ async def process_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE, ne
         wallet = config.USDT_TRC20_WALLET
         network_name = "TRC-20 (TRON)"
     
-    # Create transaction record
-    transaction = Transaction.create(
-        user_id=user_id,
-        amount=amount,
-        transaction_type='deposit',
-        status='pending',
-        payment_method=f'USDT-{network.upper()}',
-        description=f"Deposit ${amount:.2f} via {network_name}",
-        crypto_amount=exact_amount,
-        crypto_address=wallet
-    )
-    
-    text = MESSAGES[lang]['deposit_instructions'].format(
-        amount, exact_amount, exact_amount, wallet, network_name, exact_amount
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='back_to_menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    # Notify admin about pending deposit
     try:
-        admin_text = (
-            f"New Deposit Request\n\n"
-            f"User ID: {user_id}\n"
-            f"Amount: ${amount:.2f}\n"
-            f"Exact: {exact_amount:.3f} USDT\n"
-            f"Network: {network_name}\n"
-            f"Wallet: {wallet[:10]}...\n"
-            f"Transaction ID: {transaction['_id']}"
+        # Create transaction record
+        transaction_id = Transaction.create(
+            user_id=user_id,
+            amount=amount,
+            payment_method=f'USDT-{network.upper()}',
+            transaction_type='deposit'
         )
-        await context.bot.send_message(
-            chat_id=config.OWNER_ID,
-            text=admin_text
+        
+        # Update transaction with crypto details
+        from database import get_db
+        db = get_db()
+        db.transactions.update_one(
+            {"_id": transaction_id},
+            {"$set": {
+                "crypto_amount": exact_amount,
+                "crypto_address": wallet,
+                "network": network_name
+            }}
         )
+        
+        text = MESSAGES[lang]['deposit_instructions'].format(
+            amount, exact_amount, exact_amount, wallet, network_name, exact_amount
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='back_to_menu')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+        # Notify admin about pending deposit
+        try:
+            admin_text = (
+                f"💰 New Deposit Request\n\n"
+                f"👤 User ID: {user_id}\n"
+                f"💵 Amount: ${amount:.2f}\n"
+                f"🎯 Exact: {exact_amount:.3f} USDT\n"
+                f"🌐 Network: {network_name}\n"
+                f"📍 Wallet: {wallet[:10]}...\n"
+                f"🆔 Transaction ID: {transaction_id}"
+            )
+            await context.bot.send_message(
+                chat_id=config.OWNER_ID,
+                text=admin_text
+            )
+        except Exception as e:
+            logger.error(f"Could not notify admin: {e}")
+        
+        # Start payment verification in background
+        asyncio.create_task(verify_payment(transaction_id, user_id, wallet, exact_amount, network, context.bot))
+        
     except Exception as e:
-        logger.error(f"Could not notify admin: {e}")
-    
-    # Start payment verification in background
-    asyncio.create_task(verify_payment(transaction['_id'], user_id, wallet, exact_amount, context.bot))
+        logger.error(f"❌ Error processing deposit: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        await query.edit_message_text(
+            f"❌ Error processing deposit.\n\n"
+            f"Please try again or contact support.\n\n"
+            f"Error: {str(e)}"
+        )
 
-async def verify_payment(transaction_id, user_id: int, wallet: str, expected_amount: float, bot):
-    """Verify crypto payment (background task)"""
+async def verify_payment(transaction_id, user_id: int, wallet: str, expected_amount: float, network: str, bot):
+    """✅ FIXED - Verify crypto payment (background task)"""
     lang = get_user_language(user_id)
     
-    # Wait and check for payment (simplified - use real API in production)
-    await asyncio.sleep(10)  # Check every 10 seconds
-    
-    max_checks = 60  # 10 minutes total
-    for i in range(max_checks):
-        # Check if payment received using API
-        verified = await verify_crypto_payment(wallet, expected_amount)
-        
-        if verified:
-            # Update transaction
-            Transaction.update_status(transaction_id, 'completed')
-            
-            # Add balance
-            transaction = Transaction.get_by_id(transaction_id)
-            amount = transaction.get('amount', 0)
-            User.update_balance(user_id, amount)
-            
-            # Notify user
-            try:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=MESSAGES[lang]['payment_verified'].format(amount)
-                )
-            except Exception as e:
-                logger.error(f"Could not notify user {user_id}: {e}")
-            
-            # Notify admin
-            try:
-                admin_text = (
-                    f"Payment Verified!\n\n"
-                    f"User ID: {user_id}\n"
-                    f"Amount: ${amount:.2f}\n"
-                    f"Credited successfully"
-                )
-                await bot.send_message(
-                    chat_id=config.OWNER_ID,
-                    text=admin_text
-                )
-            except Exception as e:
-                logger.error(f"Could not notify admin: {e}")
-            
-            return
-        
-        await asyncio.sleep(10)
-    
-    # Payment not received after timeout
-    Transaction.update_status(transaction_id, 'failed')
-    
-    # Notify admin of failed payment
     try:
-        admin_text = (
-            f"Payment Timeout\n\n"
-            f"User ID: {user_id}\n"
-            f"Expected: {expected_amount:.3f} USDT\n"
-            f"Status: Not received after 10 minutes"
-        )
-        await bot.send_message(
-            chat_id=config.OWNER_ID,
-            text=admin_text
-        )
-    except:
-        pass
+        logger.info(f"🔍 Starting payment verification for user {user_id}")
+        logger.info(f"   Expected: {expected_amount:.3f} USDT on {network}")
+        
+        # Wait 30 seconds before first check (give time for transaction to confirm)
+        await asyncio.sleep(30)
+        
+        # Check for payment - reduced frequency to avoid rate limits
+        max_checks = 40  # 10 minutes (40 * 15 seconds)
+        
+        for i in range(max_checks):
+            await asyncio.sleep(15)  # Check every 15 seconds (instead of 10)
+            
+            try:
+                # Check if payment received using API
+                from payment import verify_crypto_payment
+                verified = await verify_crypto_payment(wallet, expected_amount, network)
+                
+                if verified:
+                    logger.info(f"✅ Payment verified for user {user_id}!")
+                    
+                    # Update transaction
+                    Transaction.update_status(transaction_id, 'completed')
+                    
+                    # Get transaction to get amount
+                    transaction = Transaction.get_by_id(transaction_id)
+                    amount = transaction.get('amount', 0)
+                    
+                    # Add balance
+                    User.update_balance(user_id, amount, operation='add')
+                    
+                    # Notify user
+                    try:
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=MESSAGES[lang]['payment_verified'].format(amount)
+                        )
+                    except Exception as e:
+                        logger.error(f"Could not notify user {user_id}: {e}")
+                    
+                    # Notify admin
+                    try:
+                        admin_text = (
+                            f"✅ Payment Verified!\n\n"
+                            f"👤 User ID: {user_id}\n"
+                            f"💰 Amount: ${amount:.2f}\n"
+                            f"✅ Credited successfully"
+                        )
+                        await bot.send_message(
+                            chat_id=config.OWNER_ID,
+                            text=admin_text
+                        )
+                    except Exception as e:
+                        logger.error(f"Could not notify admin: {e}")
+                    
+                    return
+                    
+            except Exception as e:
+                logger.error(f"Error checking payment: {e}")
+            
+            # Status update every 2 minutes (8 checks * 15 seconds)
+            if i > 0 and i % 8 == 0:
+                minutes = (i * 15) // 60
+                logger.info(f"⏳ Still checking payment for user {user_id} ({minutes} min)")
+        
+        # Payment not received after timeout
+        logger.warning(f"⏰ Payment timeout for user {user_id}")
+        # DON'T mark as failed - keep as pending so admin can manually verify
+        # Transaction.update_status(transaction_id, 'failed')
+        
+        # Notify user
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "⏰ Automatic verification timed out\n\n"
+                    "Don't worry! Your payment is being verified manually.\n\n"
+                    "If you sent the payment, admin will credit your balance within a few minutes.\n\n"
+                    f"Transaction ID: {transaction_id}\n\n"
+                    "Support: @Akash_support_bot"
+                )
+            )
+        except:
+            pass
+        
+        # Notify admin with manual verification command
+        try:
+            admin_text = (
+                f"⏰ Auto-Verification Timeout\n\n"
+                f"👤 User ID: {user_id}\n"
+                f"💵 Expected: {expected_amount:.3f} USDT\n"
+                f"🌐 Network: {network.upper()}\n"
+                f"📍 Wallet: {wallet[:10]}...\n"
+                f"🆔 Transaction ID: {transaction_id}\n\n"
+                f"⚠️ Auto-verification failed after 10 minutes\n\n"
+                f"🔍 Check manually:\n"
+                f"BEP-20: https://bscscan.com/address/{wallet}\n\n"
+                f"✅ To verify:\n"
+                f"/verify_payment {transaction_id} {expected_amount:.3f}"
+            )
+            await bot.send_message(
+                chat_id=config.OWNER_ID,
+                text=admin_text
+            )
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"❌ Error in verify_payment: {e}")
+        import traceback
+        traceback.print_exc()
 
 async def switch_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Switch user language"""
@@ -651,47 +964,273 @@ async def switch_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer(MESSAGES[new_lang]['language_switched'])
     await show_main_menu(update, context)
 
+
+
+
+
+async def handle_persistent_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle persistent keyboard button presses"""
+    text = update.message.text
+    user_id = update.effective_user.id
+    lang = get_user_language(user_id)
+    
+    # Products button
+    if text in ["🛒 Products", "🛒 商品"]:
+        # Show continent selection for products
+        keyboard = []
+        for continent_id, continent_data in CONTINENTS.items():
+            continent_name = continent_data['name'][lang]
+            keyboard.append([InlineKeyboardButton(continent_name, callback_data=f'continent_{continent_id}')])
+        
+        keyboard.append([InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='back_to_menu')])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            MESSAGES[lang]['select_continent'],
+            reply_markup=reply_markup
+        )
+    
+    # Recharge button
+    elif text in ["🌐 Recharge", "🌐 充值"]:
+        # Get minimum deposit from database
+        min_deposit = SystemSettings.get_min_deposit()
+        
+        # Preset amount buttons
+        keyboard = [
+            [
+                InlineKeyboardButton("💵 $5", callback_data='preset_5'),
+                InlineKeyboardButton("💵 $10", callback_data='preset_10'),
+                InlineKeyboardButton("💵 $20", callback_data='preset_20')
+            ],
+            [
+                InlineKeyboardButton("💵 $50", callback_data='preset_50'),
+                InlineKeyboardButton("💵 $100", callback_data='preset_100')
+            ],
+            [
+                InlineKeyboardButton("✏️ Custom Amount", callback_data='custom_amount')
+            ],
+            [InlineKeyboardButton(MESSAGES[lang]['cancel'], callback_data='cancel_deposit')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        deposit_msg = f"💳 Enter deposit amount in USD (minimum ${min_deposit:.0f}):\n\n💡 Or choose a preset amount:"
+        
+        await update.message.reply_text(
+            deposit_msg,
+            reply_markup=reply_markup
+        )
+    
+    # Contact Customer Service button
+    elif text in ["📞 Contact Customer Service", "📞 联系客服"]:
+        keyboard = [[InlineKeyboardButton("💬 Contact Support", url='https://t.me/support')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "📞 Customer Service\n\nClick below to contact our support team:",
+            reply_markup=reply_markup
+        )
+    
+    # Personal Center button
+    elif text in ["👤 Personal Center", "👤 个人中心"]:
+        user = User.get_by_telegram_id(user_id)
+        if user:
+            balance = user.get('balance', 0)
+            created_at = user.get('created_at', 'N/A')
+            
+            info_text = MESSAGES[lang]['user_info'].format(
+                user_id,
+                balance,
+                created_at
+            )
+        else:
+            info_text = "❌ User not found"
+        
+        keyboard = [[InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='back_to_menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(info_text, reply_markup=reply_markup)
+    
+    # Language button
+    elif text in ["🌍 Language", "🌍 语言"]:
+        current_lang = get_user_language(user_id)
+        new_lang = 'zh' if current_lang == 'en' else 'en'
+        User.update_language(user_id, new_lang)
+        
+        persistent_kb = get_persistent_keyboard(new_lang)
+        await update.message.reply_text(
+            MESSAGES[new_lang]['language_switched'],
+            reply_markup=persistent_kb
+        )
+    
+    # Rules button
+    elif text in ["⚠️ Rules", "⚠️ 规则"]:
+        rules_text = (
+            "⚠️ **Bot Rules**\n\n"
+            "1. No refunds after purchase\n"
+            "2. Sessions are delivered instantly\n"
+            "3. Contact support for issues\n"
+            "4. Minimum deposit: $1\n"
+            "5. Use exact USDT amounts for deposits"
+            if lang == 'en' else
+            "⚠️ **机器人规则**\n\n"
+            "1. 购买后不退款\n"
+            "2. 会话即时交付\n"
+            "3. 如有问题请联系客服\n"
+            "4. 最低充值: $1\n"
+            "5. 充值请使用准确的USDT金额"
+        )
+        keyboard = [[InlineKeyboardButton(MESSAGES[lang]['back'], callback_data='back_to_menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            rules_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
 async def handle_country_code_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text input for country codes"""
+    """Handle text input for country codes - Show product list"""
     text = update.message.text.strip()
     
     # Check if it's a country code
     if text.startswith('+'):
-        await show_country_sessions(update, context, text)
-    else:
-        # Not a country code, ignore or show help
-        pass
+        country_code = text
+        
+        # Validate the country code
+        info = get_country_info(country_code)
+        if not info:
+            await update.message.reply_text(
+                "❌ Invalid country code!\n\n"
+                "Use /start for menu."
+            )
+            return
+        
+        # Get available bulks
+        bulks = BulkSession.get_by_country(country_code)
+        
+        if not bulks:
+            await update.message.reply_text(
+                f"❌ No sessions for {info['name']} ({country_code})"
+            )
+            return
+        
+        # Calculate stats
+        total_available = sum(b['remaining_count'] for b in bulks)
+        min_price = min(b['price_per_session'] for b in bulks)
+        country_name = info['name']
+        
+        # Show product list with button (like in your image)
+        text_msg = f"**Products for {country_code} ({country_name}):**"
+        
+        button_text = f"{country_name} {country_code} — {min_price:.2f} (stock:{total_available})"
+        keyboard = [
+            [InlineKeyboardButton(button_text, callback_data=f'country_{country_code}')],
+            [InlineKeyboardButton("⬅️ Back", callback_data='product_list')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(text_msg, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """✅ FIXED - Handle all callback queries"""
+    query = update.callback_query
+    data = query.data
+    
+    # Main menu buttons
+    if data == 'back_to_menu':
+        await show_main_menu(update, context)
+    elif data == 'user_center':
+        await show_user_center(update, context)
+    elif data == 'product_list':
+        await show_product_list(update, context)
+    elif data == 'switch_language':
+        await switch_language(update, context)
+    elif data == 'cancel_deposit':
+        await query.answer()
+        await show_main_menu(update, context)
+    
+    # Continent selection
+    elif data.startswith('continent_'):
+        await show_continent_countries(update, context)
+    
+    # Country selection
+    elif data.startswith('country_'):
+        await show_main_menu(update, context)
+    
+    # Session purchase
+    elif data.startswith('buy_session_'):
+        await buy_session(update, context)
+    
+    # ✅ Preset amounts
+    elif data.startswith('preset_'):
+        await handle_preset_amount(update, context)
+    
+    # ✅ REMOVED: custom_amount is now handled by ConversationHandler
+    
+    # Payment network selection
+    elif data == 'deposit_bep20':
+        await process_deposit(update, context, 'bep20')
+    elif data == 'deposit_trc20':
+        await process_deposit(update, context, 'trc20')
+
 
 def main():
     """Start the bot"""
     # Initialize database
     init_db()
     
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # ✅ FIXED: Create application FIRST before adding any handlers
+    application = Application.builder().token(config.BOT_TOKEN).build()
     
     # Setup admin handlers
     setup_admin_handlers(application)
     
+    # Command handlers
+    application.add_handler(CommandHandler("start", start))
+    
+    # Quantity selection conversation
+    quantity_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(select_country, pattern='^country_'),
+        ],
+        states={
+            WAITING_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_quantity)]
+        },
+        fallbacks=[CallbackQueryHandler(cancel_to_menu, pattern='^product_list$'), CallbackQueryHandler(cancel_purchase, pattern='^cancel_purchase$')],
+        allow_reentry=True
+    )
+    application.add_handler(quantity_conv)
+    
+    # Purchase confirmation handlers
+    application.add_handler(CallbackQueryHandler(confirm_bulk_purchase, pattern='^confirm_bulk_purchase$'))
+    application.add_handler(CallbackQueryHandler(cancel_purchase, pattern='^cancel_purchase$'))
+    
     # Recharge conversation handler
     recharge_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_recharge, pattern='^recharge$')],
+        entry_points=[
+            CallbackQueryHandler(start_recharge, pattern='^recharge$'),
+            CallbackQueryHandler(handle_custom_amount, pattern='^custom_amount$')
+        ],
         states={
-            WAITING_DEPOSIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_deposit_amount)],
+            WAITING_DEPOSIT_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_deposit_amount),
+                CallbackQueryHandler(handle_custom_amount, pattern='^custom_amount$')
+            ],
         },
         fallbacks=[CallbackQueryHandler(show_main_menu, pattern='^cancel_deposit$')],
         allow_reentry=True
     )
     application.add_handler(recharge_conv)
     
-    # Command handlers
-    application.add_handler(CommandHandler("start", start))
+    # Persistent keyboard button handler
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.Regex(r"^\+\d+"),
+        handle_persistent_buttons
+    ))
     
+    # Text handler for country codes
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\+\d+"), handle_country_code_text))
+
     # Callback handlers
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    # Text handler for country codes
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_country_code_text))
     
     # Start bot
     logger.info("🤖 Bot started successfully!")

@@ -1,189 +1,259 @@
-import logging
+"""
+Payment Verification Module
+- BEP-20: Web3 (FREE, automatic)
+- TRC-20: TronGrid API (FREE, automatic)
+"""
+
+from web3 import Web3
 import aiohttp
+import logging
 import config
 
 logger = logging.getLogger(__name__)
 
-async def verify_crypto_payment(wallet: str, expected_amount: float, network: str = 'bep20') -> bool:
-    """
-    Verify crypto payment using blockchain API
-    
-    Args:
-        wallet: Wallet address to check
-        expected_amount: Expected USDT amount
-        network: 'bep20' or 'trc20'
-    
-    Returns:
-        bool: True if payment verified, False otherwise
-    """
+# BSC Public RPC Node (FREE, NO API KEY)
+BSC_RPC_URL = "https://bsc-rpc.publicnode.com"
+
+# USDT contract addresses
+USDT_BEP20_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
+USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
+# Transfer event signature
+TRANSFER_EVENT_SIGNATURE = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+# Initialize Web3 connection
+w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL))
+
+def check_web3_connection():
+    """Check if Web3 is connected to BSC"""
     try:
-        if network == 'bep20':
-            return await verify_bep20_payment(wallet, expected_amount)
-        elif network == 'trc20':
-            return await verify_trc20_payment(wallet, expected_amount)
-        else:
-            logger.error(f"Unknown network: {network}")
+        if not w3.is_connected():
+            logger.error("Web3 not connected to BSC")
             return False
+        
+        chain_id = w3.eth.chain_id
+        if chain_id != 56:
+            logger.error(f"Wrong chain! Expected 56 (BSC), got {chain_id}")
+            return False
+        
+        logger.info(f"✅ Web3 connected to BSC (block: {w3.eth.block_number:,})")
+        return True
     except Exception as e:
-        logger.error(f"Error verifying payment: {e}")
+        logger.error(f"Web3 connection check failed: {e}")
         return False
 
-async def verify_bep20_payment(wallet: str, expected_amount: float) -> bool:
+async def verify_bep20_payment_web3(wallet: str, expected_amount: float) -> bool:
     """
-    Verify BEP-20 USDT payment using BSCScan API
-    """
-    if not config.BSCSCAN_API_KEY:
-        logger.warning("BSCScan API key not configured")
-        return False
+    Verify BEP-20 USDT payment using Web3 (NO API KEY NEEDED!)
     
+    Connects DIRECTLY to BSC blockchain via public RPC node.
+    100% FREE, no rate limits, real-time.
+    """
     try:
-        # USDT contract on BSC
-        usdt_contract = "0x55d398326f99059fF775485246999027B3197955"
+        if not check_web3_connection():
+            logger.error("Web3 not connected, cannot verify payment")
+            return False
         
-        url = "https://api.bscscan.com/api"
-        params = {
-            'module': 'account',
-            'action': 'tokentx',
-            'contractaddress': usdt_contract,
-            'address': wallet,
-            'sort': 'desc',
-            'apikey': config.BSCSCAN_API_KEY
-        }
+        logger.info(f"🔍 Checking BEP-20 USDT transfers to {wallet[:10]}... (Web3)")
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                data = await response.json()
+        # Get current block
+        latest_block = w3.eth.block_number
+        from_block = latest_block - 1000  # Check last ~1000 blocks (~50 minutes)
+        
+        # Calculate minimum timestamp (only accept payments from last 15 minutes)
+        import time
+        current_time = int(time.time())
+        min_timestamp = current_time - (15 * 60)  # 15 minutes ago
+        
+        logger.info(f"📊 Scanning blocks {from_block:,} to {latest_block:,}")
+        logger.info(f"⏰ Only accepting transactions from last 15 minutes")
+        
+        # Pad wallet address to 32 bytes for topic filtering
+        wallet_topic = '0x' + wallet[2:].lower().zfill(64)
+        
+        # Get Transfer events where TO = our wallet
+        logs = w3.eth.get_logs({
+            'fromBlock': from_block,
+            'toBlock': 'latest',
+            'address': USDT_BEP20_CONTRACT,
+            'topics': [
+                TRANSFER_EVENT_SIGNATURE,  # Transfer event
+                None,                       # From (any address)
+                wallet_topic                # To (our wallet)
+            ]
+        })
+        
+        if not logs:
+            logger.info("⚠️ No BEP-20 USDT transfers found in recent blocks")
+            return False
+        
+        logger.info(f"📥 Found {len(logs)} incoming BEP-20 USDT transfer(s)")
+        
+        # Check each transfer
+        for log in logs:
+            # ✅ NEW: Get block timestamp to verify transaction is recent
+            block = w3.eth.get_block(log['blockNumber'])
+            block_timestamp = block['timestamp']
+            
+            # Skip old transactions
+            if block_timestamp < min_timestamp:
+                logger.info(f"⏸️ Skipping old transaction from block {log['blockNumber']} ({datetime.fromtimestamp(block_timestamp)})")
+                continue
+            
+            # Decode amount from log data
+            amount_wei = int(log['data'].hex(), 16)
+            amount_usdt = amount_wei / (10 ** 18)
+            
+            logger.info(f"💰 Incoming (recent): {amount_usdt:.6f} USDT (expected: {expected_amount:.6f})")
+            logger.info(f"   Timestamp: {datetime.fromtimestamp(block_timestamp)}")
+            
+            # Check if amount matches (with tolerance)
+            if abs(amount_usdt - expected_amount) < 0.01:
+                tx_hash = log['transactionHash'].hex()
+                block_num = log['blockNumber']
                 
-                if data['status'] == '1' and data['result']:
-                    # Check recent transactions
-                    for tx in data['result'][:10]:  # Check last 10 transactions
-                        # Convert from smallest unit (18 decimals for USDT)
-                        amount = float(tx['value']) / (10 ** 18)
-                        
-                        # Check if amount matches (with small tolerance)
-                        if abs(amount - expected_amount) < 0.01:
-                            logger.info(f"✅ BEP-20 payment verified: {amount} USDT")
-                            return True
+                logger.info(f"✅ BEP-20 payment verified!")
+                logger.info(f"   Amount: {amount_usdt:.6f} USDT")
+                logger.info(f"   Block: {block_num:,}")
+                logger.info(f"   TX: {tx_hash}")
+                logger.info(f"   Time: {datetime.fromtimestamp(block_timestamp)}")
                 
-                return False
+                return True
+        
+        logger.warning(f"⚠️ No matching BEP-20 payment found. Expected: {expected_amount:.6f} USDT")
+        return False
+        
     except Exception as e:
-        logger.error(f"Error verifying BEP-20 payment: {e}")
+        logger.error(f"Error in Web3 BEP-20 verification: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 async def verify_trc20_payment(wallet: str, expected_amount: float) -> bool:
     """
-    Verify TRC-20 USDT payment using TronGrid API
+    Verify TRC-20 USDT payment using TronGrid API (FREE!)
+    
+    Uses TronGrid API with 90k requests/day limit.
+    Checks every 15 seconds = ~5,760 checks/day (plenty of headroom!)
     """
+    if not config.TRONGRID_API_KEY:
+        logger.warning("TronGrid API key not configured")
+        return False
+    
     try:
-        # USDT contract on TRON
-        usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+        logger.info(f"🔍 Checking TRC-20 USDT transfers to {wallet[:10]}... (TronGrid)")
+        
+        # Get current timestamp (in milliseconds)
+        import time
+        current_time = int(time.time() * 1000)
+        # Only accept transactions from last 15 minutes (900,000 ms)
+        min_timestamp = current_time - (15 * 60 * 1000)
+        
+        logger.info(f"⏰ Only checking transactions from last 15 minutes")
         
         url = f"https://api.trongrid.io/v1/accounts/{wallet}/transactions/trc20"
+        headers = {'TRON-PRO-API-KEY': config.TRONGRID_API_KEY}
         params = {
+            'contract_address': USDT_TRC20_CONTRACT,
+            'only_to': 'true',
             'limit': 20,
-            'contract_address': usdt_contract
+            'min_timestamp': min_timestamp  # ✅ NEW: Only recent transactions
         }
         
-        headers = {}
-        if config.TRONGRID_API_KEY:
-            headers['TRON-PRO-API-KEY'] = config.TRONGRID_API_KEY
-        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers) as response:
+            async with session.get(url, headers=headers, params=params) as response:
+                
+                if response.status != 200:
+                    logger.error(f"TronGrid API returned status {response.status}")
+                    return False
+                
                 data = await response.json()
                 
-                if 'data' in data:
-                    # Check recent transactions
-                    for tx in data['data'][:10]:
-                        if tx['to'] == wallet:
-                            # Convert from smallest unit (6 decimals for USDT)
-                            amount = float(tx['value']) / (10 ** 6)
-                            
-                            # Check if amount matches (with small tolerance)
-                            if abs(amount - expected_amount) < 0.01:
-                                logger.info(f"✅ TRC-20 payment verified: {amount} USDT")
-                                return True
+                if 'data' not in data:
+                    logger.warning("⚠️ TronGrid API returned no data")
+                    return False
                 
+                transactions = data['data']
+                
+                if not transactions:
+                    logger.info("⚠️ No recent TRC-20 USDT transfers found")
+                    return False
+                
+                logger.info(f"📊 Found {len(transactions)} recent TRC-20 USDT transaction(s)")
+                
+                # Check each transaction
+                for tx in transactions:
+                    # Verify it's incoming to our wallet
+                    if tx.get('to') != wallet:
+                        continue
+                    
+                    # ✅ NEW: Verify transaction is recent (within last 15 minutes)
+                    tx_timestamp = tx.get('block_timestamp', 0)
+                    if tx_timestamp < min_timestamp:
+                        logger.info(f"⏸️ Skipping old transaction from {datetime.fromtimestamp(tx_timestamp/1000)}")
+                        continue
+                    
+                    # Convert from smallest unit (6 decimals for TRC-20 USDT)
+                    amount = float(tx.get('value', 0)) / (10 ** 6)
+                    
+                    logger.info(f"💰 Incoming (recent): {amount:.6f} USDT (expected: {expected_amount:.6f})")
+                    logger.info(f"   Timestamp: {datetime.fromtimestamp(tx_timestamp/1000)}")
+                    
+                    # Check if amount matches (with tolerance)
+                    if abs(amount - expected_amount) < 0.01:
+                        tx_id = tx.get('transaction_id', '')
+                        
+                        logger.info(f"✅ TRC-20 payment verified!")
+                        logger.info(f"   Amount: {amount:.6f} USDT")
+                        logger.info(f"   TX: {tx_id}")
+                        logger.info(f"   Time: {datetime.fromtimestamp(tx_timestamp/1000)}")
+                        
+                        return True
+                
+                logger.warning(f"⚠️ No matching TRC-20 payment found. Expected: {expected_amount:.6f} USDT")
                 return False
+                
     except Exception as e:
-        logger.error(f"Error verifying TRC-20 payment: {e}")
+        logger.error(f"Error in TRC-20 verification: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
-async def get_wallet_balance(wallet: str, network: str = 'bep20') -> float:
+async def verify_crypto_payment(wallet: str, expected_amount: float, network: str) -> bool:
     """
-    Get wallet USDT balance
+    Verify crypto payment
+    
+    - BEP-20: Web3 automatic (FREE, unlimited)
+    - TRC-20: TronGrid automatic (FREE, 90k/day)
     
     Args:
-        wallet: Wallet address
-        network: 'bep20' or 'trc20'
+        wallet: Wallet address that received payment
+        expected_amount: Expected USDT amount
+        network: 'bep20', 'BEP-20', 'trc20', 'TRC-20', etc.
     
     Returns:
-        float: Balance in USDT
+        True if payment verified, False otherwise
     """
-    try:
-        if network == 'bep20':
-            return await get_bep20_balance(wallet)
-        elif network == 'trc20':
-            return await get_trc20_balance(wallet)
-        else:
-            return 0.0
-    except Exception as e:
-        logger.error(f"Error getting wallet balance: {e}")
-        return 0.0
-
-async def get_bep20_balance(wallet: str) -> float:
-    """Get BEP-20 USDT balance"""
-    if not config.BSCSCAN_API_KEY:
-        return 0.0
     
-    try:
-        usdt_contract = "0x55d398326f99059fF775485246999027B3197955"
-        
-        url = "https://api.bscscan.com/api"
-        params = {
-            'module': 'account',
-            'action': 'tokenbalance',
-            'contractaddress': usdt_contract,
-            'address': wallet,
-            'tag': 'latest',
-            'apikey': config.BSCSCAN_API_KEY
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                data = await response.json()
-                
-                if data['status'] == '1':
-                    balance = float(data['result']) / (10 ** 18)
-                    return balance
-                return 0.0
-    except Exception as e:
-        logger.error(f"Error getting BEP-20 balance: {e}")
-        return 0.0
+    # Normalize network to lowercase and remove special chars
+    network_lower = network.lower().replace('-', '').replace('_', '').strip()
+    
+    logger.info(f"🔍 Verifying payment: {expected_amount:.6f} USDT on {network}")
+    logger.info(f"   Normalized network: {network_lower}")
+    
+    if 'bep20' in network_lower or 'bsc' in network_lower:
+        logger.info("✅ Using BEP-20 Web3 verification (automatic)")
+        return await verify_bep20_payment_web3(wallet, expected_amount)
+    elif 'trc20' in network_lower or 'tron' in network_lower:
+        logger.info("✅ Using TRC-20 TronGrid verification (automatic)")
+        return await verify_trc20_payment(wallet, expected_amount)
+    else:
+        logger.error(f"❌ Unknown network: {network}")
+        return False
 
-async def get_trc20_balance(wallet: str) -> float:
-    """Get TRC-20 USDT balance"""
+# Test connection on import
+if __name__ != "__main__":
     try:
-        usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-        
-        url = f"https://api.trongrid.io/v1/accounts/{wallet}"
-        
-        headers = {}
-        if config.TRONGRID_API_KEY:
-            headers['TRON-PRO-API-KEY'] = config.TRONGRID_API_KEY
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                data = await response.json()
-                
-                if 'data' in data and len(data['data']) > 0:
-                    account_data = data['data'][0]
-                    if 'trc20' in account_data:
-                        for token_address, token_data in account_data['trc20'].items():
-                            if token_address == usdt_contract:
-                                balance = float(token_data) / (10 ** 6)
-                                return balance
-                return 0.0
-    except Exception as e:
-        logger.error(f"Error getting TRC-20 balance: {e}")
-        return 0.0
+        check_web3_connection()
+    except:
+        logger.warning("Web3 connection test failed on import")
