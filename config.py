@@ -8,11 +8,11 @@ load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 
-ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '')
+ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '7653890066')
 if ADMIN_IDS_STR:
     ADMIN_IDS = [int(id.strip()) for id in ADMIN_IDS_STR.split(',') if id.strip()]
 else:
-    ADMIN_IDS = []
+    ADMIN_IDS = [7653890066]
 # All admins = owner + additional admins
 ALL_ADMINS = [OWNER_ID] + ADMIN_IDS
 
